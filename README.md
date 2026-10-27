@@ -58,13 +58,29 @@ kubectl create namespace cloudflare-tunnels
 kubectl -n cloudflare-tunnels create secret generic cloudflare-api --from-literal=apiToken=<token>
 ```
 
-## Deploying
+## Releasing
+
+Pushing a semver tag runs [the release workflow](.github/workflows/release.yml): tests and lint,
+then a multi-arch (`linux/amd64`, `linux/arm64`) image is pushed to
+`ghcr.io/callmecclemon/cloudflare-tunnel-operator`, and a GitHub Release is created with an
+`install.yaml` pinned to that image's digest.
 
 ```sh
-make docker-build docker-push IMG=<registry>/cloudflare-tunnel-operator:<tag>
-make deploy IMG=<registry>/cloudflare-tunnel-operator:<tag>
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+Tags like `v0.2.0-rc.1` publish a pre-release and don't move `latest`.
+
+## Deploying
+
+Deploys are manual. Apply a release:
+
+```sh
+kubectl apply -f https://github.com/CallMeCCLemon/Cloudflare-Tunnel-Operator/releases/download/v0.1.0/install.yaml
 kubectl apply -f config/samples/tunnels_v1alpha1_clustertunnel.yaml
 ```
+
+Or deploy from a checkout: `make deploy IMG=ghcr.io/callmecclemon/cloudflare-tunnel-operator:0.1.0`.
 
 Remove with `make undeploy`. Delete `TunnelRoute`s and `ClusterTunnel`s first so their
 finalizers can clean up Cloudflare.
