@@ -1,0 +1,32 @@
+# One shared tunnel for the whole cluster. The operator creates it in Cloudflare,
+# runs 2 cloudflared replicas in cloudflare-tunnels, and pushes every TunnelRoute
+# that references it into the tunnel's ingress config.
+#
+# Create the API token secret first:
+#   kubectl -n cloudflare-tunnels create secret generic cloudflare-api \
+#     --from-literal=apiToken=<token with Cloudflare Tunnel:Edit + DNS:Edit>
+apiVersion: tunnels.latentlab.cc/v1alpha1
+kind: ClusterTunnel
+metadata:
+  name: home
+spec:
+  cloudflare:
+    accountId: <cloudflare-account-id>
+    zoneId: <latentlab.cc-zone-id>
+    apiTokenSecretRef:
+      name: cloudflare-api
+      namespace: cloudflare-tunnels
+      key: apiToken
+  cloudflared:
+    namespace: cloudflare-tunnels
+    replicas: 2
+    resources:
+      requests:
+        cpu: 10m
+        memory: 32Mi
+      limits:
+        memory: 128Mi
+  # Uncomment to only accept routes from labelled namespaces.
+  # namespaceSelector:
+  #   matchLabels:
+  #     tunnels.latentlab.cc/allowed: "true"

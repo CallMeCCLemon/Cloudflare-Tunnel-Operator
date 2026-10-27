@@ -1,0 +1,17 @@
+# Publishes grpc.latentlab.cc through the shared "home" tunnel to the Kong proxy
+# Service in this namespace. The operator creates the proxied CNAME for you.
+apiVersion: tunnels.latentlab.cc/v1alpha1
+kind: TunnelRoute
+metadata:
+  name: web
+  namespace: grpc-demo
+spec:
+  tunnelRef:
+    name: home
+  hostname: grpc.latentlab.cc
+  service:
+    name: kong-proxy
+    port: 80
+    scheme: http
+  # Set while migrating a hostname whose CNAME was made in the dashboard.
+  # adoptExistingDnsRecord: true
