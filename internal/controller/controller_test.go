@@ -428,3 +428,53 @@ func TestMissingCredentials(t *testing.T) {
 		t.Errorf("Ready = %+v", c)
 	}
 }
+
+func TestRouteListLagDoesNotDuplicateDNS(t *testing.T) {
+	h := newHarness(t, newTunnel(), newRoute("web", "app.latentlab.cc", time.Now()))
+	h.reconcileTunnel()
+	h.reconcileRoute("web")
+	id := h.getRoute("web").Status.DNSRecordID
+
+	// The record exists but the list endpoint hasn't caught up yet.
+	h.cf.HiddenFromList[id] = true
+	h.reconcileRoute("web")
+	if len(h.cf.Records) != 1 {
+		t.Fatalf("duplicate DNS record created during list lag: %+v", h.cf.Records)
+	}
+
+	if err := h.client.Delete(h.ctx, h.getRoute("web")); err != nil {
+		t.Fatal(err)
+	}
+	h.reconcileRoute("web")
+	if len(h.cf.Records) != 0 {
+		t.Fatalf("record hidden from list was not deleted: %+v", h.cf.Records)
+	}
+}
+
+func TestRouteCollapsesAndRemovesDuplicateDNS(t *testing.T) {
+	h := newHarness(t, newTunnel(), newRoute("web", "app.latentlab.cc", time.Now()))
+	h.reconcileTunnel()
+	tunnel := h.getTunnel()
+	for range 2 {
+		_, _ = h.cf.CreateDNSRecord(h.ctx, "zone", cloudflare.DNSRecord{
+			Type: "CNAME", Name: "app.latentlab.cc", Content: tunnel.Status.TunnelCNAME,
+			Proxied: true, Comment: dnsComment(tunnel),
+		})
+	}
+	unrelated, _ := h.cf.CreateDNSRecord(h.ctx, "zone", cloudflare.DNSRecord{
+		Type: "CNAME", Name: "other.latentlab.cc", Content: "elsewhere.example.com",
+	})
+
+	h.reconcileRoute("web")
+	if len(h.cf.Records) != 2 {
+		t.Fatalf("expected duplicates collapsed to one plus the unrelated record: %+v", h.cf.Records)
+	}
+
+	if err := h.client.Delete(h.ctx, h.getRoute("web")); err != nil {
+		t.Fatal(err)
+	}
+	h.reconcileRoute("web")
+	if len(h.cf.Records) != 1 || h.cf.Records[unrelated.ID] == nil {
+		t.Fatalf("expected only the unrelated record left: %+v", h.cf.Records)
+	}
+}

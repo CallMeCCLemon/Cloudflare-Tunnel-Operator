@@ -129,7 +129,7 @@ type ClusterTunnelStatus struct {
 
 	// Routes is the number of hostnames in the pushed ingress config.
 	// +optional
-	Routes int32 `json:"routes,omitempty"`
+	Routes int32 `json:"routes"`
 
 	// ConfigHash of the last ingress configuration pushed to Cloudflare.
 	// +optional

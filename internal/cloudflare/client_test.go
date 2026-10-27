@@ -88,23 +88,25 @@ func TestClientErrors(t *testing.T) {
 	}
 }
 
-func TestClientFindDNSRecordSkipsOtherTypes(t *testing.T) {
+func TestClientFindDNSRecordsFiltersTypeAndName(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("name") != "app.example.com" {
 			t.Errorf("query = %s", r.URL.RawQuery)
 		}
 		_, _ = w.Write([]byte(`{"success":true,"result":[
 			{"id":"1","type":"TXT","name":"app.example.com","content":"x"},
-			{"id":"2","type":"CNAME","name":"app.example.com","content":"t.cfargotunnel.com","proxied":true}
+			{"id":"2","type":"CNAME","name":"app.example.com","content":"t.cfargotunnel.com","proxied":true},
+			{"id":"3","type":"CNAME","name":"other.example.com","content":"t.cfargotunnel.com","proxied":true},
+			{"id":"4","type":"CNAME","name":"App.Example.com","content":"t.cfargotunnel.com","proxied":true}
 		]}`))
 	}))
 	defer srv.Close()
 
-	rec, err := NewClient(srv.URL, "secret").FindDNSRecord(context.Background(), "zone", "app.example.com")
+	recs, err := NewClient(srv.URL, "secret").FindDNSRecords(context.Background(), "zone", "app.example.com")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rec == nil || rec.ID != "2" {
-		t.Fatalf("got %+v", rec)
+	if len(recs) != 2 || recs[0].ID != "2" || recs[1].ID != "4" {
+		t.Fatalf("got %+v, want records 2 and 4", recs)
 	}
 }

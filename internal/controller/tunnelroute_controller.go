@@ -267,6 +267,7 @@ func (e *dnsConflictError) Error() string {
 }
 
 func (r *TunnelRouteReconciler) ensureDNS(ctx context.Context, cf cloudflare.API, route *tunnelsv1alpha1.TunnelRoute, tunnel *tunnelsv1alpha1.ClusterTunnel) error {
+	log := logf.FromContext(ctx).WithValues("hostname", route.Spec.Hostname)
 	zoneID := tunnel.Spec.Cloudflare.ZoneID
 	desired := cloudflare.DNSRecord{
 		Type:    "CNAME",
@@ -277,33 +278,94 @@ func (r *TunnelRouteReconciler) ensureDNS(ctx context.Context, cf cloudflare.API
 		Comment: dnsComment(tunnel),
 	}
 
-	existing, err := cf.FindDNSRecord(ctx, zoneID, route.Spec.Hostname)
+	recs, err := r.lookupDNS(ctx, cf, route, zoneID)
 	if err != nil {
-		return fmt.Errorf("looking up DNS record: %w", err)
+		return err
 	}
 
-	var rec *cloudflare.DNSRecord
-	switch {
-	case existing == nil:
-		rec, err = cf.CreateDNSRecord(ctx, zoneID, desired)
-	case !strings.HasPrefix(existing.Comment, dnsCommentPrefix) && !route.Spec.AdoptExistingDNSRecord:
-		return &dnsConflictError{record: existing}
-	case existing.Type == desired.Type && existing.Content == desired.Content &&
-		existing.Proxied && existing.Comment == desired.Comment:
-		rec = existing
-	default:
-		rec, err = cf.UpdateDNSRecord(ctx, zoneID, existing.ID, desired)
+	// Records we may write: anything the operator manages, plus foreign ones on opt-in.
+	var candidates []cloudflare.DNSRecord
+	for _, rec := range recs {
+		if strings.HasPrefix(rec.Comment, dnsCommentPrefix) || route.Spec.AdoptExistingDNSRecord {
+			candidates = append(candidates, rec)
+		} else {
+			return &dnsConflictError{record: &rec}
+		}
 	}
-	if err != nil {
-		return fmt.Errorf("writing DNS record: %w", err)
+
+	if len(candidates) == 0 {
+		rec, err := cf.CreateDNSRecord(ctx, zoneID, desired)
+		if err != nil {
+			return fmt.Errorf("creating DNS record: %w", err)
+		}
+		log.Info("created DNS record", "id", rec.ID, "target", desired.Content)
+		route.Status.DNSRecordID = rec.ID
+		return nil
 	}
-	route.Status.DNSRecordID = rec.ID
+
+	// Keep the record we already track if it's there, otherwise the first one.
+	primary := candidates[0]
+	for _, rec := range candidates {
+		if rec.ID == route.Status.DNSRecordID {
+			primary = rec
+		}
+	}
+	if primary.Type != desired.Type || primary.Content != desired.Content ||
+		!primary.Proxied || primary.Comment != desired.Comment {
+		if _, err := cf.UpdateDNSRecord(ctx, zoneID, primary.ID, desired); err != nil {
+			return fmt.Errorf("updating DNS record: %w", err)
+		}
+		log.Info("updated DNS record", "id", primary.ID, "target", desired.Content,
+			"previousType", primary.Type, "previousTarget", primary.Content, "previousComment", primary.Comment)
+	}
+	route.Status.DNSRecordID = primary.ID
+
+	// A hostname can only have one CNAME; drop any extra copies this tunnel made.
+	for _, rec := range candidates {
+		if rec.ID != primary.ID && rec.Comment == dnsComment(tunnel) {
+			if err := cf.DeleteDNSRecord(ctx, zoneID, rec.ID); err != nil && !cloudflare.IsNotFound(err) {
+				return fmt.Errorf("deleting duplicate DNS record: %w", err)
+			}
+			log.Info("deleted duplicate DNS record", "id", rec.ID)
+		}
+	}
 	return nil
 }
 
-// removeDNS deletes the hostname's record unless another live route on the same
-// tunnel still serves that hostname (under a different path).
+// lookupDNS lists the hostname's records, and also fetches the record tracked in
+// status by ID: the list endpoint can lag behind a create, and missing a record
+// there would otherwise make us create a duplicate.
+func (r *TunnelRouteReconciler) lookupDNS(ctx context.Context, cf cloudflare.API, route *tunnelsv1alpha1.TunnelRoute, zoneID string) ([]cloudflare.DNSRecord, error) {
+	recs, err := cf.FindDNSRecords(ctx, zoneID, route.Spec.Hostname)
+	if err != nil {
+		return nil, fmt.Errorf("looking up DNS records: %w", err)
+	}
+	id := route.Status.DNSRecordID
+	if id == "" {
+		return recs, nil
+	}
+	for _, rec := range recs {
+		if rec.ID == id {
+			return recs, nil
+		}
+	}
+	tracked, err := cf.GetDNSRecord(ctx, zoneID, id)
+	switch {
+	case cloudflare.IsNotFound(err):
+		return recs, nil
+	case err != nil:
+		return nil, fmt.Errorf("fetching DNS record %s: %w", id, err)
+	case strings.EqualFold(tracked.Name, route.Spec.Hostname):
+		recs = append([]cloudflare.DNSRecord{*tracked}, recs...)
+	}
+	return recs, nil
+}
+
+// removeDNS deletes the hostname's records owned by this tunnel, unless another
+// live route on the same tunnel still serves that hostname (under a different path).
 func (r *TunnelRouteReconciler) removeDNS(ctx context.Context, cf cloudflare.API, route *tunnelsv1alpha1.TunnelRoute, tunnel *tunnelsv1alpha1.ClusterTunnel) error {
+	log := logf.FromContext(ctx).WithValues("hostname", route.Spec.Hostname)
+
 	peers := &tunnelsv1alpha1.TunnelRouteList{}
 	if err := r.List(ctx, peers, client.MatchingFields{indexRouteHostname: route.Spec.Hostname}); err != nil {
 		return err
@@ -311,20 +373,26 @@ func (r *TunnelRouteReconciler) removeDNS(ctx context.Context, cf cloudflare.API
 	for i := range peers.Items {
 		peer := &peers.Items[i]
 		if !sameRoute(peer, route) && peer.Spec.TunnelRef.Name == tunnel.Name && routeIsLive(peer) {
+			log.Info("keeping DNS record shared with another route", "route", peer.Namespace+"/"+peer.Name)
 			route.Status.DNSRecordID = ""
 			return nil
 		}
 	}
 
 	zoneID := tunnel.Spec.Cloudflare.ZoneID
-	existing, err := cf.FindDNSRecord(ctx, zoneID, route.Spec.Hostname)
+	recs, err := r.lookupDNS(ctx, cf, route, zoneID)
 	if err != nil {
-		return fmt.Errorf("looking up DNS record: %w", err)
+		return err
 	}
-	if existing != nil && existing.Comment == dnsComment(tunnel) {
-		if err := cf.DeleteDNSRecord(ctx, zoneID, existing.ID); err != nil && !cloudflare.IsNotFound(err) {
+	for _, rec := range recs {
+		if rec.Comment != dnsComment(tunnel) {
+			log.Info("leaving DNS record not owned by this tunnel", "id", rec.ID, "comment", rec.Comment)
+			continue
+		}
+		if err := cf.DeleteDNSRecord(ctx, zoneID, rec.ID); err != nil && !cloudflare.IsNotFound(err) {
 			return fmt.Errorf("deleting DNS record: %w", err)
 		}
+		log.Info("deleted DNS record", "id", rec.ID)
 	}
 	route.Status.DNSRecordID = ""
 	return nil

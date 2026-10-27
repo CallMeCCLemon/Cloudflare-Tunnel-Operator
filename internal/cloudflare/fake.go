@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"sort"
 	"sync"
 )
 
@@ -16,6 +17,9 @@ type Fake struct {
 	Records map[string]*DNSRecord
 	// ConfigPushes counts UpdateTunnelConfig calls.
 	ConfigPushes int
+	// HiddenFromList simulates the list endpoint lagging behind creates: records
+	// with these IDs are omitted from FindDNSRecords but still returned by GetDNSRecord.
+	HiddenFromList map[string]bool
 }
 
 var _ API = (*Fake)(nil)
@@ -26,6 +30,8 @@ func NewFake() *Fake {
 		Tunnels: map[string]*Tunnel{},
 		Configs: map[string]TunnelConfig{},
 		Records: map[string]*DNSRecord{},
+
+		HiddenFromList: map[string]bool{},
 	}
 }
 
@@ -104,16 +110,28 @@ func (f *Fake) UpdateTunnelConfig(_ context.Context, _, id string, cfg TunnelCon
 	return nil
 }
 
-func (f *Fake) FindDNSRecord(_ context.Context, _, name string) (*DNSRecord, error) {
+func (f *Fake) FindDNSRecords(_ context.Context, _, name string) ([]DNSRecord, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	recs := make([]DNSRecord, 0, len(f.Records))
 	for _, r := range f.Records {
-		if r.Name == name {
-			c := *r
-			return &c, nil
+		if !f.HiddenFromList[r.ID] {
+			recs = append(recs, *r)
 		}
 	}
-	return nil, nil
+	sort.Slice(recs, func(i, j int) bool { return recs[i].ID < recs[j].ID })
+	return filterAddressRecords(recs, name), nil
+}
+
+func (f *Fake) GetDNSRecord(_ context.Context, _, id string) (*DNSRecord, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r, ok := f.Records[id]
+	if !ok {
+		return nil, notFound()
+	}
+	c := *r
+	return &c, nil
 }
 
 func (f *Fake) CreateDNSRecord(_ context.Context, _ string, rec DNSRecord) (*DNSRecord, error) {

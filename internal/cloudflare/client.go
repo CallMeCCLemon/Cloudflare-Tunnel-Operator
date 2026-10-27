@@ -68,7 +68,8 @@ type API interface {
 	GetTunnelToken(ctx context.Context, accountID, tunnelID string) (string, error)
 	UpdateTunnelConfig(ctx context.Context, accountID, tunnelID string, cfg TunnelConfig) error
 
-	FindDNSRecord(ctx context.Context, zoneID, name string) (*DNSRecord, error)
+	FindDNSRecords(ctx context.Context, zoneID, name string) ([]DNSRecord, error)
+	GetDNSRecord(ctx context.Context, zoneID, recordID string) (*DNSRecord, error)
 	CreateDNSRecord(ctx context.Context, zoneID string, rec DNSRecord) (*DNSRecord, error)
 	UpdateDNSRecord(ctx context.Context, zoneID, recordID string, rec DNSRecord) (*DNSRecord, error)
 	DeleteDNSRecord(ctx context.Context, zoneID, recordID string) error
@@ -259,19 +260,42 @@ func dnsPath(zoneID string, parts ...string) string {
 	return "/zones/" + url.PathEscape(zoneID) + "/dns_records" + escapedSuffix(parts)
 }
 
-// FindDNSRecord returns the CNAME/A/AAAA record for name, or nil.
-func (c *Client) FindDNSRecord(ctx context.Context, zoneID, name string) (*DNSRecord, error) {
+// FindDNSRecords returns every CNAME/A/AAAA record named exactly name. Normally
+// there is at most one, but duplicates can exist (for example after a create that
+// the list endpoint hadn't caught up with), and callers must handle them.
+func (c *Client) FindDNSRecords(ctx context.Context, zoneID, name string) ([]DNSRecord, error) {
 	var recs []DNSRecord
-	if err := c.do(ctx, http.MethodGet, dnsPath(zoneID), url.Values{"name": {name}}, nil, &recs); err != nil {
+	q := url.Values{"name": {name}, "per_page": {"100"}}
+	if err := c.do(ctx, http.MethodGet, dnsPath(zoneID), q, nil, &recs); err != nil {
 		return nil, err
 	}
-	for i := range recs {
-		switch recs[i].Type {
+	return filterAddressRecords(recs, name), nil
+}
+
+// filterAddressRecords keeps CNAME/A/AAAA records for name. The name check guards
+// against the API's filter semantics changing; never trust it to scope a delete.
+func filterAddressRecords(recs []DNSRecord, name string) []DNSRecord {
+	out := recs[:0]
+	for _, r := range recs {
+		if !strings.EqualFold(r.Name, name) {
+			continue
+		}
+		switch r.Type {
 		case "CNAME", "A", "AAAA":
-			return &recs[i], nil
+			out = append(out, r)
 		}
 	}
-	return nil, nil
+	return out
+}
+
+// GetDNSRecord fetches a record by ID. Unlike listing, this sees a record
+// immediately after it is created.
+func (c *Client) GetDNSRecord(ctx context.Context, zoneID, recordID string) (*DNSRecord, error) {
+	var out DNSRecord
+	if err := c.do(ctx, http.MethodGet, dnsPath(zoneID, recordID), nil, nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
 }
 
 // CreateDNSRecord creates a record.
