@@ -128,6 +128,9 @@ type ClusterTunnelStatus struct {
 	ReadyReplicas int32 `json:"readyReplicas,omitempty"`
 
 	// Routes is the number of hostnames in the pushed ingress config.
+	// Defaulted so the print column shows 0 rather than blank; a merge patch
+	// never sends an unchanged zero.
+	// +kubebuilder:default=0
 	// +optional
 	Routes int32 `json:"routes"`
 

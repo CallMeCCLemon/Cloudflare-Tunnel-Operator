@@ -328,8 +328,11 @@ spec:
                 format: int32
                 type: integer
               routes:
-                description: Routes is the number of hostnames in the pushed ingress
-                  config.
+                default: 0
+                description: |-
+                  Routes is the number of hostnames in the pushed ingress config.
+                  Defaulted so the print column shows 0 rather than blank; a merge patch
+                  never sends an unchanged zero.
                 format: int32
                 type: integer
               tunnelCname:

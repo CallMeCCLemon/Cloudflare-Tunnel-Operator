@@ -25,7 +25,6 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -301,11 +300,7 @@ func (r *ClusterTunnelReconciler) finalize(ctx context.Context, tunnel *tunnelsv
 		log.Info("deleted Cloudflare tunnel", "id", tunnel.Status.TunnelID)
 	}
 
-	controllerutil.RemoveFinalizer(tunnel, tunnelsv1alpha1.ClusterTunnelFinalizer)
-	if err := r.Update(ctx, tunnel); err != nil && !apierrors.IsNotFound(err) {
-		return err
-	}
-	return nil
+	return removeFinalizer(ctx, r.Client, tunnel, tunnelsv1alpha1.ClusterTunnelFinalizer)
 }
 
 func setReady(conds *[]metav1.Condition, gen int64, status metav1.ConditionStatus, reason, msg string) {

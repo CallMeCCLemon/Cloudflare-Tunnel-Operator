@@ -410,11 +410,7 @@ func (r *TunnelRouteReconciler) finalize(ctx context.Context, route *tunnelsv1al
 			return err
 		}
 	}
-	controllerutil.RemoveFinalizer(route, tunnelsv1alpha1.TunnelRouteFinalizer)
-	if err := r.Update(ctx, route); err != nil && !apierrors.IsNotFound(err) {
-		return err
-	}
-	return nil
+	return removeFinalizer(ctx, r.Client, route, tunnelsv1alpha1.TunnelRouteFinalizer)
 }
 
 // SetupWithManager sets up the controller with the Manager.

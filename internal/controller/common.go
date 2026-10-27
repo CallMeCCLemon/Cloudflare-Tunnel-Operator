@@ -7,6 +7,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	tunnelsv1alpha1 "github.com/CallMeCCLemon/Cloudflare-Tunnel-Operator/api/v1alpha1"
 	"github.com/CallMeCCLemon/Cloudflare-Tunnel-Operator/internal/cloudflare"
@@ -70,4 +71,15 @@ func (c cloudflareClients) forTunnel(ctx context.Context, tunnel *tunnelsv1alpha
 		return nil, fmt.Errorf("API token secret %s/%s has no %q key", ref.Namespace, ref.Name, key)
 	}
 	return c.Factory(token), nil
+}
+
+// removeFinalizer drops finalizer with a merge patch rather than an Update, so it
+// doesn't fail when the object changed since it was read (a status patch, another
+// reconcile), and treats an object that is already gone as done.
+func removeFinalizer(ctx context.Context, c client.Client, obj client.Object, finalizer string) error {
+	base := obj.DeepCopyObject().(client.Object)
+	if !controllerutil.RemoveFinalizer(obj, finalizer) {
+		return nil
+	}
+	return client.IgnoreNotFound(c.Patch(ctx, obj, client.MergeFrom(base)))
 }
