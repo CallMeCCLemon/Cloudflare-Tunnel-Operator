@@ -1,6 +1,6 @@
 # Testing strategy
 
-Status as of 2026-10-28 (v0.1.0 plus unreleased tunnel rename and the Ginkgo port of the controller tests).
+Status as of 2026-10-28 (v0.1.0 plus unreleased changes: tunnel rename, the Ginkgo port of the controller specs, and the move to the cloudflare-go SDK; all live-tested on 2026-10-28).
 
 The operator has three automated layers and one manual one. The automated layers are fast
 and catch logic regressions; they do **not** prove the operator works against a real API
@@ -19,26 +19,33 @@ Static checks run alongside: `make lint` (golangci-lint, config in `.golangci.ym
 
 ## 1. Cloudflare client tests
 
-Each test starts an `httptest.Server` that asserts the request the client sends (method,
-path, `Authorization` header, JSON body) and returns a canned Cloudflare response envelope.
+`internal/cloudflare.Client` implements the `API` interface with the official
+[cloudflare-go](https://github.com/cloudflare/cloudflare-go) SDK (v7.12.0). The tests point
+it at an `httptest` stub server that records each request and returns canned Cloudflare
+response envelopes. Like the real API, the stub answers requests for page 2 or later with an
+empty page: the SDK's auto-pager only stops on an empty page, so every list call makes one
+extra request.
 
-Covered:
+- `TestClientRequests` is one table covering **all 13 methods**: method, path, query
+  (e.g. `name.exact=` for DNS lookups, `is_deleted=false` for tunnels), the bearer token,
+  the exact JSON body, and how the response maps back to our types. It checks that unset
+  fields are omitted, so the catch-all ingress rule goes out as just
+  `{"service": "http_status:404"}`, and that `FindDNSRecords` keeps only CNAME/A/AAAA
+  records whose name matches exactly, so a change in the API's filter can never widen a
+  delete.
+- `TestClientNotFound`: a 404 satisfies `IsNotFound`, keeps Cloudflare's message, and is not
+  retried.
+- `TestClientRetriesRateLimits`: a 429 followed by a 200 succeeds after the SDK's backoff.
+- `TestClientRejectsNonCNAMEWrites`: the client refuses to write anything but a CNAME,
+  without sending a request.
+- `TestIsNotFoundMatchesFakeErrors`: the Fake's errors behave like the SDK's for
+  `IsNotFound`.
 
-- `CreateTunnel`: path, auth header, `config_src: cloudflare` body.
-- `GetTunnelToken`, `UpdateTunnelConfig`: paths and the `{"config": {...}}` wrapper.
-- `RenameTunnel`: `PATCH` to the tunnel path with only `name` in the body.
-- Error handling: a `success: false` envelope becomes an `APIError`, `IsNotFound` works,
-  and the error message includes Cloudflare's codes.
-- `FindDNSRecords`: keeps only CNAME/A/AAAA records **whose name matches exactly**
-  (case-insensitive), so a change in the API's `name` filter can never widen a delete.
+Coverage: 45% of `internal/cloudflare`. The number understates it, because `fake.go` is in
+the same package and is only exercised from the controller specs.
 
-Not covered offline: `FindTunnelByName`, `DeleteTunnel`, `CleanupTunnelConnections`,
-`GetDNSRecord`, `CreateDNSRecord`, `UpdateDNSRecord`, `DeleteDNSRecord`. All of these were
-exercised against the real API in the live run, but a regression in their paths or bodies
-would only show up there.
-
-Coverage: 35% of `internal/cloudflare`. The number understates it, because `fake.go` is in
-the same package and is only exercised from the controller tests.
+These tests prove the requests match what we believe the API expects. They don't prove the
+API agrees; the live run does that.
 
 ## 2. Controller specs
 
@@ -127,7 +134,7 @@ calls Cloudflare.
 
 ## 4. Live run on the home lab cluster
 
-The only end-to-end check of real behaviour. Last run 2026-10-27, operator running locally
+The only end-to-end check of real behaviour. First run 2026-10-27, operator running locally
 (`go run ./cmd`) against the cluster, a throwaway `operator-test` tunnel and
 `tunnel-operator-*.latentlab.cc` hostnames, with a `traefik/whoami` backend.
 
@@ -156,7 +163,24 @@ Also verified after the v0.1.0 release: the published image runs in-cluster, hol
 leader lease, created the shared `home` tunnel, and served `grpc-demo.latentlab.cc` end to
 end (web and gRPC API through Kong).
 
-Not yet live-tested: **tunnel rename** (unreleased), path-based routes, `namespaceSelector`,
+**2026-10-28: SDK client and rename.** With the in-cluster operator scaled to 0, a local build
+on the cloudflare-go SDK reconciled the live `home` tunnel and grpc-demo route, then a throwaway
+`sdk-test` tunnel and `tunnel-operator-sdk.latentlab.cc` route:
+
+| Scenario | Checked by | Result |
+|---|---|---|
+| Existing tunnel and route | `home` and `greeter` stayed Ready; config re-pushed through the SDK; grpc-demo HTTP 200 | Pass. The connectors stayed on config `version=2`: Cloudflare only versions changed content, so the SDK sent a config identical to the old client's |
+| New tunnel, DNS and traffic | Tunnel created, 4 edge connections per pod, config received, CNAME created, `curl` through the edge reached whoami (HTTP 200) | Pass |
+| Rename | `tunnelName` set: same tunnel ID, name read back from Cloudflare, 0 pod restarts and 0 reconnects, traffic still 200; cleared: renamed back; exactly 2 rename calls | Pass |
+| Cleanup | DNS record and tunnel deleted | Pass |
+
+Notes from this run: the cluster still had the v0.1.0 CRD, which silently dropped the new
+`status.tunnelName` until `make install` updated it, so **CRDs must be upgraded with the
+operator**. The finalizer ran twice on tunnel deletion again (a stale cache read), now without
+errors since a second delete succeeds. And the first local start failed to sync its caches
+during a Tailscale blip to the API server, which is unrelated to the operator.
+
+Not yet live-tested: path-based routes, `namespaceSelector`,
 credential rotation, and Cloudflare API errors or rate limits.
 
 ### Running it again
@@ -184,14 +208,11 @@ The live run uses real Cloudflare resources, so use throwaway names.
    and finalizer semantics, UIDs and timestamps, and the watch mappings in
    `SetupWithManager`. It's the biggest gap, and the double-finalize bug would have shown
    up here.
-2. **Offline tests for the rest of the Cloudflare client.** Table-driven `httptest` cases
-   for the seven untested methods. Cheap, and catches path or body regressions without a
-   live run.
-3. **A scripted live smoke test** (`make smoke`) that automates the live-run steps against a
+2. **A scripted live smoke test** (`make smoke`) that automates the live-run steps against a
    throwaway tunnel and hostname, with cleanup in a `trap`. Run it by hand before each
    release; it needs the real API token, so not in public-repo CI.
-4. **Extend the e2e suite** to create a ClusterTunnel and TunnelRoute in Kind, pointing
+3. **Extend the e2e suite** to create a ClusterTunnel and TunnelRoute in Kind, pointing
    `--cloudflare-api-url` at a small fake Cloudflare server running in the cluster. That
    exercises the released image's whole reconcile path in CI without real credentials.
-5. **Failure-path tests**: Cloudflare 429/5xx with backoff, the token Secret changing,
+4. **Failure-path tests in the controller specs**: a Cloudflare 5xx surfacing in conditions, the token Secret changing,
    and a tunnel deleted out from under the operator (the `IsNotFound` recreate branch).

@@ -105,8 +105,10 @@ make test                 # unit + controller tests (fake Cloudflare API)
 make run                  # run against the current kube context
 ```
 
-The Cloudflare client in `internal/cloudflare` is a small hand-written REST client for the
-tunnel and DNS endpoints; `cloudflare.Fake` backs the controller tests.
+`internal/cloudflare` wraps the official [cloudflare-go](https://github.com/cloudflare/cloudflare-go)
+SDK (v7) behind a small `API` interface covering the tunnel and DNS calls the operator makes. The SDK
+retries 429 and 5xx responses with backoff. `cloudflare.Fake` implements the same interface in memory
+for the controller specs.
 
 ## License
 

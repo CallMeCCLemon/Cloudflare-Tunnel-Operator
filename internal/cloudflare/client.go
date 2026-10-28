@@ -1,28 +1,38 @@
-// Package cloudflare is a minimal client for the parts of the Cloudflare API the
-// operator needs: Cloudflare Tunnels (cfd_tunnel) and DNS records.
+// Package cloudflare wraps the parts of the Cloudflare API the operator needs,
+// Cloudflare Tunnels and DNS records, behind the small API interface the
+// controllers use. Client implements it with the official cloudflare-go SDK;
+// Fake implements it in memory for tests.
 package cloudflare
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
+
+	cfsdk "github.com/cloudflare/cloudflare-go/v7"
+	"github.com/cloudflare/cloudflare-go/v7/dns"
+	"github.com/cloudflare/cloudflare-go/v7/option"
+	"github.com/cloudflare/cloudflare-go/v7/zero_trust"
 )
 
 // DefaultBaseURL is the Cloudflare v4 API.
 const DefaultBaseURL = "https://api.cloudflare.com/client/v4"
 
-// Tunnel is a Cloudflare tunnel as returned by the API.
+const (
+	// maxRetries applies to 408, 409, 429 and 5xx responses and connection errors;
+	// the SDK backs off between attempts and honours Retry-After.
+	maxRetries     = 3
+	requestTimeout = 30 * time.Second
+)
+
+// Tunnel is a Cloudflare tunnel.
 type Tunnel struct {
-	ID     string `json:"id"`
-	Name   string `json:"name"`
-	Status string `json:"status"`
+	ID     string
+	Name   string
+	Status string
 }
 
 // IngressRule is one entry of a tunnel's ingress configuration.
@@ -41,24 +51,26 @@ type OriginRequest struct {
 	OriginServerName string `json:"originServerName,omitempty"`
 }
 
-// TunnelConfig is a remotely-managed tunnel configuration.
+// TunnelConfig is a remotely-managed tunnel configuration. The JSON tags make it
+// hashable for change detection; they are not what goes over the wire.
 type TunnelConfig struct {
 	Ingress []IngressRule `json:"ingress"`
 }
 
-// DNSRecord is a Cloudflare DNS record.
+// DNSRecord is a Cloudflare DNS record. The operator only ever writes CNAMEs, but
+// reads any address record so it can spot conflicts.
 type DNSRecord struct {
-	ID      string `json:"id,omitempty"`
-	Type    string `json:"type"`
-	Name    string `json:"name"`
-	Content string `json:"content"`
-	Proxied bool   `json:"proxied"`
-	TTL     int    `json:"ttl,omitempty"`
-	Comment string `json:"comment,omitempty"`
+	ID      string
+	Type    string
+	Name    string
+	Content string
+	Proxied bool
+	TTL     int
+	Comment string
 }
 
-// API is everything the controllers use; the HTTP client implements it and
-// tests substitute a fake.
+// API is everything the controllers use; Client implements it and tests
+// substitute Fake.
 type API interface {
 	FindTunnelByName(ctx context.Context, accountID, name string) (*Tunnel, error)
 	GetTunnel(ctx context.Context, accountID, tunnelID string) (*Tunnel, error)
@@ -79,206 +91,202 @@ type API interface {
 // Factory builds an API client from an API token.
 type Factory func(apiToken string) API
 
-// NewFactory returns a Factory producing HTTP clients against baseURL.
+// NewFactory returns a Factory producing SDK-backed clients against baseURL.
 func NewFactory(baseURL string) Factory {
 	return func(apiToken string) API { return NewClient(baseURL, apiToken) }
 }
 
-// Client talks to the Cloudflare REST API.
+// Client implements API with the cloudflare-go SDK.
 type Client struct {
-	baseURL string
-	token   string
-	http    *http.Client
+	tunnels *zero_trust.TunnelCloudflaredService
+	records *dns.RecordService
 }
 
 // NewClient returns a Client. An empty baseURL uses DefaultBaseURL.
+//
+// It builds only the two services it needs, and deliberately not via
+// cfsdk.NewClient: that also reads CLOUDFLARE_API_TOKEN,
+// CLOUDFLARE_API_KEY and CLOUDFLARE_EMAIL from the environment, which could add a
+// second set of credentials. The token always comes from the ClusterTunnel's Secret.
 func NewClient(baseURL, apiToken string) *Client {
 	if baseURL == "" {
 		baseURL = DefaultBaseURL
 	}
+	opts := []option.RequestOption{
+		option.WithHTTPClient(&http.Client{}),
+		option.WithBaseURL(strings.TrimRight(baseURL, "/") + "/"),
+		option.WithAPIToken(apiToken),
+		option.WithMaxRetries(maxRetries),
+		option.WithRequestTimeout(requestTimeout),
+	}
 	return &Client{
-		baseURL: strings.TrimRight(baseURL, "/"),
-		token:   apiToken,
-		http:    &http.Client{Timeout: 30 * time.Second},
+		tunnels: zero_trust.NewTunnelCloudflaredService(opts...),
+		records: dns.NewRecordService(opts...),
 	}
 }
 
-// APIError is a non-success response from Cloudflare.
+// APIError is a non-success response. The SDK returns *cfsdk.Error; the Fake
+// returns this, so IsNotFound treats both alike.
 type APIError struct {
 	StatusCode int
-	Errors     []struct {
-		Code    int    `json:"code"`
-		Message string `json:"message"`
-	}
+	Message    string
 }
 
 func (e *APIError) Error() string {
-	msgs := make([]string, 0, len(e.Errors))
-	for _, m := range e.Errors {
-		msgs = append(msgs, fmt.Sprintf("%d: %s", m.Code, m.Message))
-	}
-	return fmt.Sprintf("cloudflare API returned %d: %s", e.StatusCode, strings.Join(msgs, "; "))
+	return fmt.Sprintf("cloudflare API returned %d: %s", e.StatusCode, e.Message)
 }
 
 // IsNotFound reports whether err is a 404 from Cloudflare.
 func IsNotFound(err error) bool {
+	var sdkErr *cfsdk.Error
+	if errors.As(err, &sdkErr) {
+		return sdkErr.StatusCode == http.StatusNotFound
+	}
 	var apiErr *APIError
 	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound
 }
 
-type envelope struct {
-	Success bool            `json:"success"`
-	Errors  json.RawMessage `json:"errors"`
-	Result  json.RawMessage `json:"result"`
-}
-
-func (c *Client) do(ctx context.Context, method, path string, query url.Values, body, out any) error {
-	u := c.baseURL + path
-	if len(query) > 0 {
-		u += "?" + query.Encode()
-	}
-
-	var reader io.Reader
-	if body != nil {
-		b, err := json.Marshal(body)
-		if err != nil {
-			return fmt.Errorf("encoding request: %w", err)
-		}
-		reader = bytes.NewReader(b)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, method, u, reader)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return fmt.Errorf("%s %s: %w", method, path, err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	raw, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("reading response: %w", err)
-	}
-
-	var env envelope
-	if err := json.Unmarshal(raw, &env); err != nil {
-		return fmt.Errorf("%s %s: unexpected response (%d): %w", method, path, resp.StatusCode, err)
-	}
-	if resp.StatusCode >= 300 || !env.Success {
-		apiErr := &APIError{StatusCode: resp.StatusCode}
-		_ = json.Unmarshal(env.Errors, &apiErr.Errors)
-		return apiErr
-	}
-	if out != nil && len(env.Result) > 0 {
-		if err := json.Unmarshal(env.Result, out); err != nil {
-			return fmt.Errorf("decoding result: %w", err)
-		}
-	}
-	return nil
-}
-
-// escapedSuffix renders path segments as "/a/b", escaping each one.
-func escapedSuffix(parts []string) string {
-	var b strings.Builder
-	for _, part := range parts {
-		b.WriteString("/")
-		b.WriteString(url.PathEscape(part))
-	}
-	return b.String()
-}
-
-func tunnelPath(accountID string, parts ...string) string {
-	return "/accounts/" + url.PathEscape(accountID) + "/cfd_tunnel" + escapedSuffix(parts)
+func tunnelFrom(t *zero_trust.CloudflareTunnel) *Tunnel {
+	return &Tunnel{ID: t.ID, Name: t.Name, Status: string(t.Status)}
 }
 
 // FindTunnelByName returns the non-deleted tunnel with that name, or nil.
 func (c *Client) FindTunnelByName(ctx context.Context, accountID, name string) (*Tunnel, error) {
-	var tunnels []Tunnel
-	q := url.Values{"name": {name}, "is_deleted": {"false"}}
-	if err := c.do(ctx, http.MethodGet, tunnelPath(accountID), q, nil, &tunnels); err != nil {
-		return nil, err
-	}
-	for i := range tunnels {
-		if tunnels[i].Name == name {
-			return &tunnels[i], nil
+	iter := c.tunnels.ListAutoPaging(ctx, zero_trust.TunnelCloudflaredListParams{
+		AccountID: cfsdk.F(accountID),
+		Name:      cfsdk.F(name),
+		IsDeleted: cfsdk.F(false),
+	})
+	for iter.Next() {
+		if t := iter.Current(); t.Name == name {
+			return tunnelFrom(&t), nil
 		}
 	}
-	return nil, nil
+	return nil, iter.Err()
 }
 
 // GetTunnel fetches a tunnel by ID.
 func (c *Client) GetTunnel(ctx context.Context, accountID, tunnelID string) (*Tunnel, error) {
-	var t Tunnel
-	if err := c.do(ctx, http.MethodGet, tunnelPath(accountID, tunnelID), nil, nil, &t); err != nil {
+	t, err := c.tunnels.Get(ctx, tunnelID, zero_trust.TunnelCloudflaredGetParams{AccountID: cfsdk.F(accountID)})
+	if err != nil {
 		return nil, err
 	}
-	return &t, nil
+	return tunnelFrom(t), nil
 }
 
 // CreateTunnel creates a remotely-managed tunnel (config lives in Cloudflare).
 func (c *Client) CreateTunnel(ctx context.Context, accountID, name string) (*Tunnel, error) {
-	var t Tunnel
-	body := map[string]string{"name": name, "config_src": "cloudflare"}
-	if err := c.do(ctx, http.MethodPost, tunnelPath(accountID), nil, body, &t); err != nil {
+	t, err := c.tunnels.New(ctx, zero_trust.TunnelCloudflaredNewParams{
+		AccountID: cfsdk.F(accountID),
+		Name:      cfsdk.F(name),
+		ConfigSrc: cfsdk.F(zero_trust.TunnelCloudflaredNewParamsConfigSrcCloudflare),
+	})
+	if err != nil {
 		return nil, err
 	}
-	return &t, nil
+	return tunnelFrom(t), nil
 }
 
 // RenameTunnel changes a tunnel's name. The ID, token, connectors and DNS
 // records are unaffected; the name is only a label.
 func (c *Client) RenameTunnel(ctx context.Context, accountID, tunnelID, name string) (*Tunnel, error) {
-	var t Tunnel
-	body := map[string]string{"name": name}
-	if err := c.do(ctx, http.MethodPatch, tunnelPath(accountID, tunnelID), nil, body, &t); err != nil {
+	t, err := c.tunnels.Edit(ctx, tunnelID, zero_trust.TunnelCloudflaredEditParams{
+		AccountID: cfsdk.F(accountID),
+		Name:      cfsdk.F(name),
+	})
+	if err != nil {
 		return nil, err
 	}
-	return &t, nil
+	return tunnelFrom(t), nil
 }
 
 // DeleteTunnel deletes a tunnel. It must have no active connections.
 func (c *Client) DeleteTunnel(ctx context.Context, accountID, tunnelID string) error {
-	return c.do(ctx, http.MethodDelete, tunnelPath(accountID, tunnelID), nil, nil, nil)
+	_, err := c.tunnels.Delete(ctx, tunnelID, zero_trust.TunnelCloudflaredDeleteParams{AccountID: cfsdk.F(accountID)})
+	return err
 }
 
 // CleanupTunnelConnections removes stale connector registrations.
 func (c *Client) CleanupTunnelConnections(ctx context.Context, accountID, tunnelID string) error {
-	return c.do(ctx, http.MethodDelete, tunnelPath(accountID, tunnelID, "connections"), nil, nil, nil)
+	_, err := c.tunnels.Connections.Delete(ctx, tunnelID,
+		zero_trust.TunnelCloudflaredConnectionDeleteParams{AccountID: cfsdk.F(accountID)})
+	return err
 }
 
 // GetTunnelToken returns the token cloudflared uses to run the tunnel.
 func (c *Client) GetTunnelToken(ctx context.Context, accountID, tunnelID string) (string, error) {
-	var token string
-	if err := c.do(ctx, http.MethodGet, tunnelPath(accountID, tunnelID, "token"), nil, nil, &token); err != nil {
+	token, err := c.tunnels.Token.Get(ctx, tunnelID, zero_trust.TunnelCloudflaredTokenGetParams{AccountID: cfsdk.F(accountID)})
+	if err != nil {
 		return "", err
 	}
-	return token, nil
+	return *token, nil
 }
 
-// UpdateTunnelConfig replaces the tunnel's ingress configuration.
+// UpdateTunnelConfig replaces the tunnel's ingress configuration. Unset fields
+// are omitted, so the catch-all rule goes out as just {"service": "http_status:404"}.
 func (c *Client) UpdateTunnelConfig(ctx context.Context, accountID, tunnelID string, cfg TunnelConfig) error {
-	body := map[string]TunnelConfig{"config": cfg}
-	return c.do(ctx, http.MethodPut, tunnelPath(accountID, tunnelID, "configurations"), nil, body, nil)
+	rules := make([]zero_trust.TunnelCloudflaredConfigurationUpdateParamsConfigIngress, 0, len(cfg.Ingress))
+	for _, in := range cfg.Ingress {
+		rule := zero_trust.TunnelCloudflaredConfigurationUpdateParamsConfigIngress{Service: cfsdk.F(in.Service)}
+		if in.Hostname != "" {
+			rule.Hostname = cfsdk.F(in.Hostname)
+		}
+		if in.Path != "" {
+			rule.Path = cfsdk.F(in.Path)
+		}
+		if o := in.OriginRequest; o != nil {
+			var or zero_trust.TunnelCloudflaredConfigurationUpdateParamsConfigIngressOriginRequest
+			if o.NoTLSVerify {
+				or.NoTLSVerify = cfsdk.F(true)
+			}
+			if o.HTTP2Origin {
+				or.HTTP2Origin = cfsdk.F(true)
+			}
+			if o.HTTPHostHeader != "" {
+				or.HTTPHostHeader = cfsdk.F(o.HTTPHostHeader)
+			}
+			if o.OriginServerName != "" {
+				or.OriginServerName = cfsdk.F(o.OriginServerName)
+			}
+			rule.OriginRequest = cfsdk.F(or)
+		}
+		rules = append(rules, rule)
+	}
+	_, err := c.tunnels.Configurations.Update(ctx, tunnelID, zero_trust.TunnelCloudflaredConfigurationUpdateParams{
+		AccountID: cfsdk.F(accountID),
+		Config: cfsdk.F(zero_trust.TunnelCloudflaredConfigurationUpdateParamsConfig{
+			Ingress: cfsdk.F(rules),
+		}),
+	})
+	return err
 }
 
-func dnsPath(zoneID string, parts ...string) string {
-	return "/zones/" + url.PathEscape(zoneID) + "/dns_records" + escapedSuffix(parts)
+func recordFrom(r *dns.RecordResponse) *DNSRecord {
+	return &DNSRecord{
+		ID:      r.ID,
+		Type:    string(r.Type),
+		Name:    r.Name,
+		Content: r.Content,
+		Proxied: r.Proxied,
+		TTL:     int(r.TTL),
+		Comment: r.Comment,
+	}
 }
 
 // FindDNSRecords returns every CNAME/A/AAAA record named exactly name. Normally
 // there is at most one, but duplicates can exist (for example after a create that
 // the list endpoint hadn't caught up with), and callers must handle them.
 func (c *Client) FindDNSRecords(ctx context.Context, zoneID, name string) ([]DNSRecord, error) {
+	iter := c.records.ListAutoPaging(ctx, dns.RecordListParams{
+		ZoneID: cfsdk.F(zoneID),
+		Name:   cfsdk.F(dns.RecordListParamsName{Exact: cfsdk.F(name)}),
+	})
 	var recs []DNSRecord
-	q := url.Values{"name": {name}, "per_page": {"100"}}
-	if err := c.do(ctx, http.MethodGet, dnsPath(zoneID), q, nil, &recs); err != nil {
+	for iter.Next() {
+		r := iter.Current()
+		recs = append(recs, *recordFrom(&r))
+	}
+	if err := iter.Err(); err != nil {
 		return nil, err
 	}
 	return filterAddressRecords(recs, name), nil
@@ -303,32 +311,60 @@ func filterAddressRecords(recs []DNSRecord, name string) []DNSRecord {
 // GetDNSRecord fetches a record by ID. Unlike listing, this sees a record
 // immediately after it is created.
 func (c *Client) GetDNSRecord(ctx context.Context, zoneID, recordID string) (*DNSRecord, error) {
-	var out DNSRecord
-	if err := c.do(ctx, http.MethodGet, dnsPath(zoneID, recordID), nil, nil, &out); err != nil {
+	r, err := c.records.Get(ctx, recordID, dns.RecordGetParams{ZoneID: cfsdk.F(zoneID)})
+	if err != nil {
 		return nil, err
 	}
-	return &out, nil
+	return recordFrom(r), nil
 }
 
-// CreateDNSRecord creates a record.
+func cnameParam(rec DNSRecord) (dns.CNAMERecordParam, error) {
+	if rec.Type != "CNAME" {
+		return dns.CNAMERecordParam{}, fmt.Errorf("only CNAME records can be written, got %q", rec.Type)
+	}
+	ttl := rec.TTL
+	if ttl == 0 {
+		ttl = 1 // automatic
+	}
+	return dns.CNAMERecordParam{
+		Type:    cfsdk.F(dns.CNAMERecordTypeCNAME),
+		Name:    cfsdk.F(rec.Name),
+		Content: cfsdk.F(rec.Content),
+		Proxied: cfsdk.F(rec.Proxied),
+		TTL:     cfsdk.F(dns.TTL(ttl)),
+		Comment: cfsdk.F(rec.Comment),
+	}, nil
+}
+
+// CreateDNSRecord creates a CNAME record.
 func (c *Client) CreateDNSRecord(ctx context.Context, zoneID string, rec DNSRecord) (*DNSRecord, error) {
-	var out DNSRecord
-	if err := c.do(ctx, http.MethodPost, dnsPath(zoneID), nil, rec, &out); err != nil {
+	body, err := cnameParam(rec)
+	if err != nil {
 		return nil, err
 	}
-	return &out, nil
+	r, err := c.records.New(ctx, dns.RecordNewParams{ZoneID: cfsdk.F(zoneID), Body: body})
+	if err != nil {
+		return nil, err
+	}
+	return recordFrom(r), nil
 }
 
-// UpdateDNSRecord overwrites a record.
+// UpdateDNSRecord overwrites a record with a CNAME. Cloudflare allows changing the
+// type this way, which is how an adopted A record becomes the tunnel's CNAME.
 func (c *Client) UpdateDNSRecord(ctx context.Context, zoneID, recordID string, rec DNSRecord) (*DNSRecord, error) {
-	var out DNSRecord
-	if err := c.do(ctx, http.MethodPut, dnsPath(zoneID, recordID), nil, rec, &out); err != nil {
+	body, err := cnameParam(rec)
+	if err != nil {
 		return nil, err
 	}
-	return &out, nil
+	r, err := c.records.Update(ctx, recordID, dns.RecordUpdateParams{ZoneID: cfsdk.F(zoneID), Body: body})
+	if err != nil {
+		return nil, err
+	}
+	return recordFrom(r), nil
 }
 
 // DeleteDNSRecord deletes a record.
 func (c *Client) DeleteDNSRecord(ctx context.Context, zoneID, recordID string) error {
-	return c.do(ctx, http.MethodDelete, dnsPath(zoneID, recordID), nil, nil, nil)
+	_, err := c.records.Delete(ctx, recordID, dns.RecordDeleteParams{ZoneID: cfsdk.F(zoneID)})
+	return err
 }
