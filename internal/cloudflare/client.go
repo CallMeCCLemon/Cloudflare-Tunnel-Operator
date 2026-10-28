@@ -63,6 +63,7 @@ type API interface {
 	FindTunnelByName(ctx context.Context, accountID, name string) (*Tunnel, error)
 	GetTunnel(ctx context.Context, accountID, tunnelID string) (*Tunnel, error)
 	CreateTunnel(ctx context.Context, accountID, name string) (*Tunnel, error)
+	RenameTunnel(ctx context.Context, accountID, tunnelID, name string) (*Tunnel, error)
 	DeleteTunnel(ctx context.Context, accountID, tunnelID string) error
 	CleanupTunnelConnections(ctx context.Context, accountID, tunnelID string) error
 	GetTunnelToken(ctx context.Context, accountID, tunnelID string) (string, error)
@@ -226,6 +227,17 @@ func (c *Client) CreateTunnel(ctx context.Context, accountID, name string) (*Tun
 	var t Tunnel
 	body := map[string]string{"name": name, "config_src": "cloudflare"}
 	if err := c.do(ctx, http.MethodPost, tunnelPath(accountID), nil, body, &t); err != nil {
+		return nil, err
+	}
+	return &t, nil
+}
+
+// RenameTunnel changes a tunnel's name. The ID, token, connectors and DNS
+// records are unaffected; the name is only a label.
+func (c *Client) RenameTunnel(ctx context.Context, accountID, tunnelID, name string) (*Tunnel, error) {
+	var t Tunnel
+	body := map[string]string{"name": name}
+	if err := c.do(ctx, http.MethodPatch, tunnelPath(accountID, tunnelID), nil, body, &t); err != nil {
 		return nil, err
 	}
 	return &t, nil

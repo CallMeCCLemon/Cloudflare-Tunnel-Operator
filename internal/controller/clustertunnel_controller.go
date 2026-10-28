@@ -133,6 +133,19 @@ func (r *ClusterTunnelReconciler) reconcileTunnel(ctx context.Context, tunnel *t
 	}
 	tunnel.Status.Health = remote.Status
 
+	if want := tunnel.DesiredTunnelName(); want != "" && remote.Name != want {
+		renamed, err := cf.RenameTunnel(ctx, accountID, tunnel.Status.TunnelID, want)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("renaming tunnel %q to %q: %w", remote.Name, want, err)
+		}
+		if renamed.Name == "" {
+			renamed.Name = want
+		}
+		logf.FromContext(ctx).Info("renamed Cloudflare tunnel", "id", tunnel.Status.TunnelID, "from", remote.Name, "to", renamed.Name)
+		remote = renamed
+	}
+	tunnel.Status.TunnelName = remote.Name
+
 	token, err := cf.GetTunnelToken(ctx, accountID, tunnel.Status.TunnelID)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("fetching tunnel token: %w", err)

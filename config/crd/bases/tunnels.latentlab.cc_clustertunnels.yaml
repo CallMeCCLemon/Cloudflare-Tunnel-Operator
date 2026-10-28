@@ -20,6 +20,10 @@ spec:
     - jsonPath: .status.tunnelId
       name: Tunnel ID
       type: string
+    - jsonPath: .status.tunnelName
+      name: Cloudflare Name
+      priority: 1
+      type: string
     - jsonPath: .status.health
       name: Health
       type: string
@@ -234,8 +238,11 @@ spec:
                 type: object
                 x-kubernetes-map-type: atomic
               tunnelName:
-                description: TunnelName is the tunnel's name in Cloudflare. Defaults
-                  to metadata.name.
+                description: |-
+                  TunnelName is the tunnel's name in Cloudflare. Defaults to metadata.name.
+                  Changing it renames the tunnel in place; the ID, DNS records and connectors
+                  are unaffected. An adopted tunnel (existingTunnelId) keeps its own name
+                  unless this is set.
                 type: string
             required:
             - cloudflare
@@ -341,6 +348,9 @@ spec:
                 type: string
               tunnelId:
                 description: TunnelID is the Cloudflare tunnel UUID.
+                type: string
+              tunnelName:
+                description: TunnelName is the tunnel's current name in Cloudflare.
                 type: string
             type: object
         required:

@@ -89,6 +89,9 @@ type ClusterTunnelSpec struct {
 	Cloudflare CloudflareSpec `json:"cloudflare"`
 
 	// TunnelName is the tunnel's name in Cloudflare. Defaults to metadata.name.
+	// Changing it renames the tunnel in place; the ID, DNS records and connectors
+	// are unaffected. An adopted tunnel (existingTunnelId) keeps its own name
+	// unless this is set.
 	// +optional
 	TunnelName string `json:"tunnelName,omitempty"`
 
@@ -110,6 +113,10 @@ type ClusterTunnelStatus struct {
 	// TunnelID is the Cloudflare tunnel UUID.
 	// +optional
 	TunnelID string `json:"tunnelId,omitempty"`
+
+	// TunnelName is the tunnel's current name in Cloudflare.
+	// +optional
+	TunnelName string `json:"tunnelName,omitempty"`
 
 	// TunnelCNAME is the target route hostnames should CNAME to.
 	// +optional
@@ -155,6 +162,7 @@ type ClusterTunnelStatus struct {
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Cluster,shortName=ctun
 // +kubebuilder:printcolumn:name="Tunnel ID",type=string,JSONPath=`.status.tunnelId`
+// +kubebuilder:printcolumn:name="Cloudflare Name",type=string,JSONPath=`.status.tunnelName`,priority=1
 // +kubebuilder:printcolumn:name="Health",type=string,JSONPath=`.status.health`
 // +kubebuilder:printcolumn:name="Routes",type=integer,JSONPath=`.status.routes`
 // +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
@@ -175,12 +183,22 @@ type ClusterTunnel struct {
 	Status ClusterTunnelStatus `json:"status,omitempty"`
 }
 
-// CloudflareTunnelName is the tunnel's name in Cloudflare.
+// CloudflareTunnelName is the name to create or look up the tunnel by.
 func (t *ClusterTunnel) CloudflareTunnelName() string {
 	if t.Spec.TunnelName != "" {
 		return t.Spec.TunnelName
 	}
 	return t.Name
+}
+
+// DesiredTunnelName is the name the operator keeps the tunnel at, or "" when it
+// should leave the name alone: an adopted tunnel keeps whatever name it already
+// has unless spec.tunnelName asks for one.
+func (t *ClusterTunnel) DesiredTunnelName() string {
+	if t.Spec.TunnelName == "" && !t.Status.Managed {
+		return ""
+	}
+	return t.CloudflareTunnelName()
 }
 
 // +kubebuilder:object:root=true

@@ -17,6 +17,8 @@ type Fake struct {
 	Records map[string]*DNSRecord
 	// ConfigPushes counts UpdateTunnelConfig calls.
 	ConfigPushes int
+	// Renames counts RenameTunnel calls.
+	Renames int
 	// HiddenFromList simulates the list endpoint lagging behind creates: records
 	// with these IDs are omitted from FindDNSRecords but still returned by GetDNSRecord.
 	HiddenFromList map[string]bool
@@ -73,6 +75,19 @@ func (f *Fake) CreateTunnel(_ context.Context, _, name string) (*Tunnel, error) 
 	defer f.mu.Unlock()
 	t := &Tunnel{ID: f.id("tunnel"), Name: name, Status: "inactive"}
 	f.Tunnels[t.ID] = t
+	c := *t
+	return &c, nil
+}
+
+func (f *Fake) RenameTunnel(_ context.Context, _, id, name string) (*Tunnel, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	t, ok := f.Tunnels[id]
+	if !ok {
+		return nil, notFound()
+	}
+	t.Name = name
+	f.Renames++
 	c := *t
 	return &c, nil
 }

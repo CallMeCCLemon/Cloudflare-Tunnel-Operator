@@ -110,3 +110,26 @@ func TestClientFindDNSRecordsFiltersTypeAndName(t *testing.T) {
 		t.Fatalf("got %+v, want records 2 and 4", recs)
 	}
 }
+
+func TestClientRenameTunnel(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPatch || r.URL.Path != "/accounts/acct/cfd_tunnel/abc" {
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		var body map[string]string
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if len(body) != 1 || body["name"] != "latentlab" {
+			t.Errorf("body = %v, want only the new name", body)
+		}
+		_, _ = w.Write([]byte(`{"success":true,"result":{"id":"abc","name":"latentlab","status":"healthy"}}`))
+	}))
+	defer srv.Close()
+
+	tun, err := NewClient(srv.URL, "secret").RenameTunnel(context.Background(), "acct", "abc", "latentlab")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tun.ID != "abc" || tun.Name != "latentlab" {
+		t.Fatalf("got %+v", tun)
+	}
+}
